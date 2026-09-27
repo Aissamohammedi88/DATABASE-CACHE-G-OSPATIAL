@@ -1,0 +1,1299 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# NEXUS GEO-INTEL PRO v5.0.0
+# Cache multi-niveaux, 6 sources, detection IP, 20 categories, favoris, historique, export
+# Auteur : Aissa Mohammedi (DGK) - Licence NEXUS-OPEN-2.0
+# Compatible a-Shell iOS - os.path uniquement - stdlib pure
+
+import os
+import re
+import sys
+import ssl
+import json
+import math
+import time
+import gzip
+import zlib
+import lzma
+import bz2
+import sqlite3
+import hashlib
+import threading
+import urllib.request
+import urllib.parse
+import urllib.error
+import collections
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+VERSION = "5.0.0"
+AUTEUR = "Aissa Mohammedi (DGK)"
+LICENCE = "NEXUS-OPEN-2.0"
+USER_AGENT = "NexusGeoIntel/5.0"
+
+# ---------------------------------------------------------------
+# CHEMINS
+# ---------------------------------------------------------------
+
+HOME = os.path.expanduser("~")
+BASE = os.path.join(HOME, "Documents", "nexus_geo_intel")
+os.makedirs(BASE, exist_ok=True)
+
+CACHE_DIR = os.path.join(BASE, "cache")
+LOG_DIR = os.path.join(BASE, "logs")
+EXPORT_DIR = os.path.join(BASE, "exports")
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(EXPORT_DIR, exist_ok=True)
+
+DB_PATH = os.path.join(BASE, "geo.db")
+LOG_FILE = os.path.join(LOG_DIR, "geo.log")
+
+PORT = 8115
+
+CTX = ssl.create_default_context()
+CTX.check_hostname = False
+CTX.verify_mode = ssl.CERT_NONE
+
+CONFIG = {
+"rayon_defaut": 2000,
+"rayon_max": 50000,
+"max_resultats": 200,
+"cache_ram_max": 5000,
+"cache_ttl": 86400,
+"compression_level": 9,
+"timeout_source": 20,
+"rate_limit_max": 200,
+"rate_limit_window": 60,
+"langue": "fr",
+}
+
+LOG_LOCK = threading.RLock()
+
+
+def log(msg):
+ts = datetime.now(timezone.utc).isoformat()
+line = "[" + ts + "] " + str(msg)
+with LOG_LOCK:
+try:
+print(line, flush=True)
+except Exception:
+pass
+try:
+with open(LOG_FILE, "a", encoding="utf-8") as f:
+f.write(line + "\n")
+except OSError:
+pass
+
+
+# ---------------------------------------------------------------
+# BASE DE DONNEES
+# ---------------------------------------------------------------
+
+def init_db():
+conn = sqlite3.connect(DB_PATH, timeout=30)
+c = conn.cursor()
+
+c.execute("""CREATE TABLE IF NOT EXISTS cache (
+cle TEXT PRIMARY KEY,
+data BLOB NOT NULL,
+taille_originale INTEGER,
+taille_compressee INTEGER,
+compression TEXT,
+timestamp REAL,
+hits INTEGER DEFAULT 0,
+source TEXT)""")
+c.execute("CREATE INDEX IF NOT EXISTS idx_cache_ts ON cache(timestamp)")
+c.execute("CREATE INDEX IF NOT EXISTS idx_cache_source ON cache(source)")
+
+c.execute("""CREATE TABLE IF NOT EXISTS lieux (
+id TEXT PRIMARY KEY,
+source TEXT,
+nom TEXT,
+categorie TEXT,
+adresse TEXT,
+ville TEXT,
+lat REAL,
+lon REAL,
+telephone TEXT,
+site_web TEXT,
+horaires TEXT,
+qualite_score REAL DEFAULT 0,
+sources_multiples INTEGER DEFAULT 1,
+metadata TEXT,
+timestamp REAL)""")
+c.execute("CREATE INDEX IF NOT EXISTS idx_lat ON lieux(lat)")
+c.execute("CREATE INDEX IF NOT EXISTS idx_lon ON lieux(lon)")
+c.execute("CREATE INDEX IF NOT EXISTS idx_cat ON lieux(categorie)")
+
+c.execute("""CREATE TABLE IF NOT EXISTS stats (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+timestamp REAL,
+requete TEXT,
+latence_ms REAL,
+cache_hit INTEGER,
+resultats INTEGER,
+rayon INTEGER,
+categorie TEXT)""")
+
+c.execute("""CREATE TABLE IF NOT EXISTS favoris (
+id TEXT PRIMARY KEY,
+nom TEXT,
+categorie TEXT,
+lat REAL,
+lon REAL,
+adresse TEXT,
+note INTEGER DEFAULT 5,
+timestamp REAL)""")
+
+c.execute("""CREATE TABLE IF NOT EXISTS historique (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+timestamp REAL,
+lat REAL,
+lon REAL,
+rayon INTEGER,
+categorie TEXT,
+resultats INTEGER)""")
+
+conn.commit()
+conn.close()
+log("DB : " + DB_PATH)
+
+
+def get_db():
+conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+conn.row_factory = sqlite3.Row
+try:
+conn.execute("PRAGMA journal_mode = WAL")
+conn.execute("PRAGMA synchronous = NORMAL")
+conn.execute("PRAGMA cache_size = -16000")
+conn.execute("PRAGMA temp_store = MEMORY")
+except Exception:
+pass
+return conn
+
+
+# ---------------------------------------------------------------
+# COMPRESSION
+# ---------------------------------------------------------------
+
+class Compressor:
+@staticmethod
+def compress(data, algo="auto"):
+raw = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+taille_orig = len(raw)
+if algo == "auto":
+if taille_orig < 512:
+algo = "gzip"
+elif taille_orig < 4096:
+algo = "zlib"
+else:
+algo = "lzma"
+try:
+if algo == "gzip":
+out = gzip.compress(raw, compresslevel=CONFIG["compression_level"])
+elif algo == "zlib":
+out = zlib.compress(raw, level=CONFIG["compression_level"])
+elif algo == "bz2":
+out = bz2.compress(raw, compresslevel=9)
+elif algo == "lzma":
+out = lzma.compress(raw, preset=9)
+else:
+out = gzip.compress(raw, compresslevel=CONFIG["compression_level"])
+algo = "gzip"
+except Exception:
+out = gzip.compress(raw, compresslevel=9)
+algo = "gzip"
+return out, taille_orig, algo
+
+@staticmethod
+def decompress(data, algo="gzip"):
+try:
+if algo == "gzip":
+raw = gzip.decompress(data)
+elif algo == "zlib":
+raw = zlib.decompress(data)
+elif algo == "bz2":
+raw = bz2.decompress(data)
+elif algo == "lzma":
+raw = lzma.decompress(data)
+else:
+raw = gzip.decompress(data)
+return json.loads(raw.decode("utf-8"))
+except Exception:
+return None
+
+@staticmethod
+def cle(query):
+return hashlib.sha256(query.encode("utf-8")).hexdigest()[:40]
+
+
+# ---------------------------------------------------------------
+# GEOMATH
+# ---------------------------------------------------------------
+
+def distance(lat1, lon1, lat2, lon2):
+R = 6371000.0
+p1 = math.radians(lat1)
+p2 = math.radians(lat2)
+dp = math.radians(lat2 - lat1)
+dl = math.radians(lon2 - lon1)
+a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+a = max(0.0, min(1.0, a))
+return 2 * R * math.asin(math.sqrt(a))
+
+
+def bbox(lat, lon, rayon_m):
+dlat = rayon_m / 111320.0
+cos_lat = math.cos(math.radians(lat))
+if abs(cos_lat) < 0.01:
+cos_lat = 0.01
+dlon = rayon_m / (111320.0 * cos_lat)
+return (lat - dlat, lon - dlon, lat + dlat, lon + dlon)
+
+
+def normaliser(cat):
+if not cat:
+return "inconnu"
+try:
+import unicodedata
+cat = unicodedata.normalize("NFKD", str(cat))
+cat = "".join(c for c in cat if not unicodedata.combining(c))
+except Exception:
+pass
+cat = cat.lower().strip()
+cat = re.sub(r"[^a-z0-9_\-]", "_", cat)
+return cat[:50] or "inconnu"
+
+
+def score_qualite(lieu):
+s = 0.0
+if lieu.get("nom") and len(str(lieu["nom"])) > 2:
+s += 20
+if lieu.get("adresse"):
+s += 15
+if lieu.get("telephone"):
+s += 10
+if lieu.get("site_web"):
+s += 10
+if lieu.get("horaires"):
+s += 15
+if lieu.get("categorie") and lieu["categorie"] != "inconnu":
+s += 10
+if lieu.get("lat") and lieu.get("lon"):
+s += 10
+if lieu.get("sources_multiples", 1) >= 2:
+s += 10
+return min(100.0, s)
+
+
+# ---------------------------------------------------------------
+# RATE LIMITER
+# ---------------------------------------------------------------
+
+class RateLimiter:
+def __init__(self, max_req, window):
+self.max_req = max_req
+self.window = window
+self.hits = {}
+self.lock = threading.RLock()
+
+def allow(self, key):
+now = time.time()
+with self.lock:
+q = self.hits.setdefault(key, collections.deque())
+while q and now - q[0] > self.window:
+q.popleft()
+if len(q) >= self.max_req:
+return False
+q.append(now)
+return True
+
+
+RATE = RateLimiter(CONFIG["rate_limit_max"], CONFIG["rate_limit_window"])
+
+
+# ---------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------
+
+def http_fetch(url, data=None, headers=None, timeout=None):
+if timeout is None:
+timeout = CONFIG["timeout_source"]
+h = {"User-Agent": USER_AGENT, "Accept": "application/json,*/*"}
+if headers:
+h.update(headers)
+try:
+if data is not None:
+req = urllib.request.Request(url, data=data, headers=h)
+else:
+req = urllib.request.Request(url, headers=h)
+with urllib.request.urlopen(req, timeout=timeout, context=CTX) as r:
+raw = r.read(5000000)
+enc = r.headers.get("Content-Encoding", "").lower()
+if "gzip" in enc:
+try:
+raw = gzip.decompress(raw)
+except Exception:
+pass
+return raw.decode("utf-8", "ignore")
+except Exception:
+return None
+
+
+def geoloc_ip():
+services = [
+"https://ipapi.co/json/",
+"https://ipinfo.io/json",
+"https://ip-api.com/json/",
+]
+for url in services:
+try:
+resp = http_fetch(url, timeout=8)
+if not resp:
+continue
+d = json.loads(resp)
+lat = d.get("latitude") or d.get("lat")
+lon = d.get("longitude") or d.get("lon")
+if lat and lon:
+return {
+"lat": float(lat),
+"lon": float(lon),
+"ville": d.get("city", ""),
+"pays": d.get("country_name", d.get("country", "")),
+}
+except Exception:
+continue
+return None
+
+
+# ---------------------------------------------------------------
+# SOURCES
+# ---------------------------------------------------------------
+
+def source_osm(lat, lon, rayon, cat=None):
+filtre = ""
+if cat:
+filtre = '["amenity"="{}"]'.format(normaliser(cat))
+query = '[out:json][timeout:25];(node{f}(around:{r},{la},{lo});way{f}(around:{r},{la},{lo}););out center 200;'.format(
+f=filtre, r=rayon, la=lat, lo=lon)
+try:
+data = urllib.parse.urlencode({"data": query}).encode("utf-8")
+resp = http_fetch("https://overpass-api.de/api/interpreter", data=data, timeout=30)
+if not resp:
+return []
+result = json.loads(resp)
+except Exception:
+return []
+lieux = []
+for el in result.get("elements", []):
+tags = el.get("tags", {})
+lat_l = el.get("lat") or (el.get("center") or {}).get("lat")
+lon_l = el.get("lon") or (el.get("center") or {}).get("lon")
+if not lat_l or not lon_l:
+continue
+lieu = {
+"id": "osm_" + str(el.get("type", "node")) + "_" + str(el.get("id")),
+"source": "osm",
+"nom": tags.get("name", tags.get("name:fr", "") or "Sans nom"),
+"categorie": normaliser(tags.get("amenity", tags.get("shop", tags.get("tourism", "inconnu")))),
+"adresse": (str(tags.get("addr:street", "")) + " " + str(tags.get("addr:housenumber", ""))).strip(),
+"ville": tags.get("addr:city", ""),
+"telephone": tags.get("phone", tags.get("contact:phone", "")),
+"site_web": tags.get("website", tags.get("contact:website", "")),
+"horaires": tags.get("opening_hours", ""),
+"lat": float(lat_l),
+"lon": float(lon_l),
+"metadata": {"osm_id": el.get("id")},
+}
+lieu["qualite_score"] = score_qualite(lieu)
+lieu["distance_m"] = round(distance(lat, lon, lat_l, lon_l), 0)
+lieu["sources_multiples"] = 1
+lieux.append(lieu)
+return lieux
+
+
+def source_nominatim(lat, lon, rayon, cat=None):
+try:
+if cat:
+url = "https://nominatim.openstreetmap.org/search?q={}&format=json&limit=30&bounded=1&viewbox={},{},{},{}".format(
+urllib.parse.quote(cat), lon - 0.05, lat - 0.05, lon + 0.05, lat + 0.05)
+else:
+url = "https://nominatim.openstreetmap.org/reverse?lat={}&lon={}&format=json&zoom=16&addressdetails=1".format(lat, lon)
+resp = http_fetch(url, timeout=15)
+if not resp:
+return []
+data = json.loads(resp)
+if not isinstance(data, list):
+data = [data]
+except Exception:
+return []
+lieux = []
+for el in data:
+try:
+lat_l = float(el.get("lat", lat))
+lon_l = float(el.get("lon", lon))
+lieu = {
+"id": "nominatim_" + str(el.get("place_id", ""))[:20],
+"source": "nominatim",
+"nom": (el.get("display_name", "") or "Sans nom").split(",")[0],
+"categorie": normaliser(el.get("type", "inconnu")),
+"adresse": el.get("display_name", ""),
+"ville": (el.get("address") or {}).get("city", ""),
+"telephone": "",
+"site_web": "",
+"horaires": "",
+"lat": lat_l,
+"lon": lon_l,
+"metadata": {},
+}
+lieu["qualite_score"] = score_qualite(lieu)
+lieu["distance_m"] = round(distance(lat, lon, lat_l, lon_l), 0)
+lieu["sources_multiples"] = 1
+lieux.append(lieu)
+except Exception:
+continue
+return lieux
+
+
+def source_photon(lat, lon, rayon, cat=None):
+try:
+if cat:
+url = "https://photon.komoot.io/api/?q={}&lat={}&lon={}&limit=50&lang={}".format(
+urllib.parse.quote(cat), lat, lon, CONFIG["langue"])
+else:
+url = "https://photon.komoot.io/reverse?lat={}&lon={}&limit=30&lang={}".format(
+lat, lon, CONFIG["langue"])
+resp = http_fetch(url, timeout=15)
+if not resp:
+return []
+data = json.loads(resp)
+except Exception:
+return []
+lieux = []
+for el in data.get("features", []):
+props = el.get("properties", {})
+geom = el.get("geometry", {})
+coords = geom.get("coordinates", [lon, lat])
+try:
+lon_l, lat_l = float(coords[0]), float(coords[1])
+except Exception:
+continue
+lieu = {
+"id": "photon_" + str(props.get("osm_id", ""))[:20],
+"source": "photon",
+"nom": props.get("name", "Sans nom"),
+"categorie": normaliser(props.get("osm_value", props.get("type", "inconnu"))),
+"adresse": (str(props.get("street", "")) + " " + str(props.get("housenumber", ""))).strip(),
+"ville": props.get("city", ""),
+"telephone": "",
+"site_web": "",
+"horaires": "",
+"lat": lat_l,
+"lon": lon_l,
+"metadata": {},
+}
+lieu["qualite_score"] = score_qualite(lieu)
+lieu["distance_m"] = round(distance(lat, lon, lat_l, lon_l), 0)
+lieu["sources_multiples"] = 1
+lieux.append(lieu)
+return lieux
+
+
+def source_wikidata(lat, lon, rayon, cat=None):
+rayon_km = max(1, min(50, int(rayon / 1000.0)))
+query = ('SELECT ?item ?itemLabel ?lat ?lon WHERE { '
+'SERVICE wikibase:around { '
+'?item wdt:P625 ?loc . '
+'bd:serviceParam wikibase:center "Point({lon} {lat})"^^geo:wktLiteral . '
+'bd:serviceParam wikibase:radius "{r}" . '
+'} '
+'?item wdt:P625 ?loc . '
+'BIND(geof:latitude(?loc) AS ?lat) '
+'BIND(geof:longitude(?loc) AS ?lon) '
+'SERVICE wikibase:label { bd:serviceParam wikibase:language "{lang},en" . } '
+'} LIMIT 50').format(lat=lat, lon=lon, r=rayon_km, lang=CONFIG["langue"])
+url = "https://query.wikidata.org/sparql?query=" + urllib.parse.quote(query) + "&format=json"
+resp = http_fetch(url, headers={"Accept": "application/sparql-results+json"}, timeout=25)
+if not resp:
+return []
+try:
+data = json.loads(resp)
+except Exception:
+return []
+lieux = []
+for b in data.get("results", {}).get("bindings", []):
+try:
+lat_l = float(b["lat"]["value"])
+lon_l = float(b["lon"]["value"])
+lieu = {
+"id": "wd_" + b["item"]["value"].split("/")[-1],
+"source": "wikidata",
+"nom": b.get("itemLabel", {}).get("value", "Sans nom"),
+"categorie": "lieu_notable",
+"adresse": "",
+"ville": "",
+"telephone": "",
+"site_web": "",
+"horaires": "",
+"lat": lat_l,
+"lon": lon_l,
+"metadata": {},
+}
+lieu["qualite_score"] = score_qualite(lieu)
+lieu["distance_m"] = round(distance(lat, lon, lat_l, lon_l), 0)
+lieu["sources_multiples"] = 1
+lieux.append(lieu)
+except Exception:
+continue
+return lieux
+
+
+def source_overpass_mirror(lat, lon, rayon, cat=None):
+filtre = ""
+if cat:
+filtre = '["amenity"="{}"]'.format(normaliser(cat))
+query = '[out:json][timeout:25];(node{f}(around:{r},{la},{lo});way{f}(around:{r},{la},{lo}););out center 150;'.format(
+f=filtre, r=rayon, la=lat, lo=lon)
+try:
+data = urllib.parse.urlencode({"data": query}).encode("utf-8")
+resp = http_fetch("https://overpass.kumi.systems/api/interpreter", data=data, timeout=30)
+if not resp:
+return []
+result = json.loads(resp)
+except Exception:
+return []
+lieux = []
+for el in result.get("elements", []):
+tags = el.get("tags", {})
+lat_l = el.get("lat") or (el.get("center") or {}).get("lat")
+lon_l = el.get("lon") or (el.get("center") or {}).get("lon")
+if not lat_l or not lon_l:
+continue
+lieu = {
+"id": "osm_mirror_" + str(el.get("id")),
+"source": "overpass_mirror",
+"nom": tags.get("name", "Sans nom"),
+"categorie": normaliser(tags.get("amenity", "inconnu")),
+"adresse": tags.get("addr:street", ""),
+"ville": tags.get("addr:city", ""),
+"telephone": tags.get("phone", ""),
+"site_web": tags.get("website", ""),
+"horaires": tags.get("opening_hours", ""),
+"lat": float(lat_l),
+"lon": float(lon_l),
+"metadata": {},
+}
+lieu["qualite_score"] = score_qualite(lieu)
+lieu["distance_m"] = round(distance(lat, lon, lat_l, lon_l), 0)
+lieu["sources_multiples"] = 1
+lieux.append(lieu)
+return lieux
+
+
+def source_local(lat, lon, rayon, cat=None):
+lat_min, lon_min, lat_max, lon_max = bbox(lat, lon, rayon)
+conn = get_db()
+try:
+c = conn.cursor()
+if cat:
+c.execute("SELECT * FROM lieux WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ? AND categorie LIKE ? LIMIT ?",
+(lat_min, lat_max, lon_min, lon_max, "%" + normaliser(cat) + "%", CONFIG["max_resultats"]))
+else:
+c.execute("SELECT * FROM lieux WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ? LIMIT ?",
+(lat_min, lat_max, lon_min, lon_max, CONFIG["max_resultats"]))
+rows = [dict(r) for r in c.fetchall()]
+except Exception:
+rows = []
+finally:
+conn.close()
+lieux = []
+for r in rows:
+r["distance_m"] = round(distance(lat, lon, r["lat"], r["lon"]), 0)
+if r["distance_m"] <= rayon:
+lieux.append(r)
+return lieux
+
+
+# ---------------------------------------------------------------
+# FUSION
+# ---------------------------------------------------------------
+
+def fusion(lat, lon, rayon, cat=None):
+resultats = []
+lock = threading.RLock()
+
+def worker(fn):
+try:
+r = fn(lat, lon, rayon, cat)
+with lock:
+resultats.extend(r)
+except Exception:
+pass
+
+fns = [source_osm, source_nominatim, source_photon,
+source_wikidata, source_overpass_mirror, source_local]
+
+threads = []
+for fn in fns:
+t = threading.Thread(target=worker, args=(fn,), daemon=True)
+t.start()
+threads.append(t)
+
+for t in threads:
+t.join(timeout=CONFIG["timeout_source"] + 15)
+
+uniques = {}
+for l in resultats:
+key = normaliser(l.get("nom", ""))[:30] + "__" + str(round(l.get("lat", 0), 3)) + "_" + str(round(l.get("lon", 0), 3))
+if key in uniques:
+ex = uniques[key]
+ex["sources_multiples"] = ex.get("sources_multiples", 1) + 1
+for champ in ("telephone", "site_web", "horaires", "adresse", "ville"):
+if not ex.get(champ) and l.get(champ):
+ex[champ] = l[champ]
+ex["qualite_score"] = score_qualite(ex)
+else:
+l["sources_multiples"] = 1
+uniques[key] = l
+
+liste = list(uniques.values())
+liste.sort(key=lambda x: x.get("distance_m", 999999))
+liste = [x for x in liste if x.get("distance_m", 999999) <= rayon]
+return liste[:CONFIG["max_resultats"]]
+
+
+# ---------------------------------------------------------------
+# CACHE
+# ---------------------------------------------------------------
+
+class MultiCache:
+def __init__(self):
+self.ram = {}
+self.order = collections.deque()
+self.lock = threading.RLock()
+
+def get(self, cle):
+with self.lock:
+if cle in self.ram:
+return self.ram[cle]
+conn = get_db()
+try:
+c = conn.cursor()
+c.execute("SELECT data, compression, timestamp FROM cache WHERE cle = ?", (cle,))
+row = c.fetchone()
+if row:
+if time.time() - row["timestamp"] > CONFIG["cache_ttl"]:
+c.execute("DELETE FROM cache WHERE cle = ?", (cle,))
+conn.commit()
+return None
+data = Compressor.decompress(row["data"], row["compression"])
+if data:
+c.execute("UPDATE cache SET hits = hits + 1 WHERE cle = ?", (cle,))
+conn.commit()
+self._ram_set(cle, data)
+return data
+except Exception:
+pass
+finally:
+conn.close()
+return None
+
+def set(self, cle, data):
+compressed, orig, algo = Compressor.compress(data)
+self._ram_set(cle, data)
+conn = get_db()
+try:
+c = conn.cursor()
+c.execute("""INSERT OR REPLACE INTO cache
+(cle, data, taille_originale, taille_compressee, compression, timestamp, hits, source)
+VALUES (?, ?, ?, ?, ?, ?, COALESCE((SELECT hits FROM cache WHERE cle = ?), 0), ?)""",
+(cle, compressed, orig, len(compressed), algo, time.time(), cle, "search"))
+conn.commit()
+except Exception:
+pass
+finally:
+conn.close()
+
+def _ram_set(self, cle, data):
+with self.lock:
+if cle not in self.ram:
+self.order.append(cle)
+if len(self.order) > CONFIG["cache_ram_max"]:
+old = self.order.popleft()
+self.ram.pop(old, None)
+self.ram[cle] = data
+
+def stats(self):
+conn = get_db()
+try:
+c = conn.cursor()
+c.execute("SELECT COUNT(*) as n, SUM(taille_originale) as o, SUM(taille_compressee) as cp, SUM(hits) as h FROM cache")
+row = c.fetchone()
+except Exception:
+row = {"n": 0, "o": 0, "cp": 0, "h": 0}
+finally:
+conn.close()
+o = row["o"] or 0
+cp = row["cp"] or 0
+ratio = (1 - cp / o) * 100 if o > 0 else 0
+return {
+"entrees_sqlite": row["n"] or 0,
+"entrees_ram": len(self.ram),
+"taille_originale": o,
+"taille_compressee": cp,
+"compression_pct": round(ratio, 2),
+"total_hits": row["h"] or 0,
+}
+
+def vider(self):
+with self.lock:
+self.ram.clear()
+self.order.clear()
+conn = get_db()
+try:
+conn.execute("DELETE FROM cache")
+conn.commit()
+except Exception:
+pass
+finally:
+conn.close()
+
+
+CACHE = MultiCache()
+
+
+# ---------------------------------------------------------------
+# FAVORIS + HISTORIQUE + STATS
+# ---------------------------------------------------------------
+
+def ajouter_favori(lieu, note=5):
+fid = hashlib.sha256((str(lieu.get("nom", "")) + str(lieu.get("lat", 0)) + str(lieu.get("lon", 0))).encode()).hexdigest()[:16]
+conn = get_db()
+try:
+conn.execute("""INSERT OR REPLACE INTO favoris
+(id, nom, categorie, lat, lon, adresse, note, timestamp)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+(fid, lieu.get("nom", ""), lieu.get("categorie", ""),
+lieu.get("lat", 0), lieu.get("lon", 0), lieu.get("adresse", ""),
+note, time.time()))
+conn.commit()
+finally:
+conn.close()
+return fid
+
+
+def lister_favoris():
+conn = get_db()
+try:
+c = conn.cursor()
+c.execute("SELECT * FROM favoris ORDER BY timestamp DESC")
+return [dict(r) for r in c.fetchall()]
+finally:
+conn.close()
+
+
+def ajouter_historique(lat, lon, rayon, cat, nb):
+conn = get_db()
+try:
+conn.execute("INSERT INTO historique (timestamp, lat, lon, rayon, categorie, resultats) VALUES (?, ?, ?, ?, ?, ?)",
+(time.time(), lat, lon, rayon, cat or "", nb))
+conn.commit()
+except Exception:
+pass
+finally:
+conn.close()
+
+
+def lister_historique(limit=100):
+conn = get_db()
+try:
+c = conn.cursor()
+c.execute("SELECT * FROM historique ORDER BY timestamp DESC LIMIT ?", (limit,))
+return [dict(r) for r in c.fetchall()]
+finally:
+conn.close()
+
+
+def log_stats(requete, latence, hit, nb, rayon, cat):
+conn = get_db()
+try:
+conn.execute("INSERT INTO stats (timestamp, requete, latence_ms, cache_hit, resultats, rayon, categorie) VALUES (?, ?, ?, ?, ?, ?, ?)",
+(time.time(), requete[:200], latence, hit, nb, rayon, cat or ""))
+conn.commit()
+except Exception:
+pass
+finally:
+conn.close()
+
+
+def stats_globales():
+conn = get_db()
+try:
+c = conn.cursor()
+c.execute("SELECT COUNT(*) as n, AVG(latence_ms) as a, SUM(cache_hit) as h, SUM(resultats) as r FROM stats")
+row = c.fetchone()
+except Exception:
+row = {"n": 0, "a": 0, "h": 0, "r": 0}
+finally:
+conn.close()
+return {
+"requetes_total": row["n"] or 0,
+"latence_moyenne_ms": round(row["a"] or 0, 3),
+"cache_hits": row["h"] or 0,
+"resultats_total": row["r"] or 0,
+}
+
+
+# ---------------------------------------------------------------
+# SEARCH
+# ---------------------------------------------------------------
+
+def search(lat, lon, rayon=None, cat=None, tri="distance"):
+if rayon is None:
+rayon = CONFIG["rayon_defaut"]
+if rayon > CONFIG["rayon_max"]:
+rayon = CONFIG["rayon_max"]
+
+t0 = time.time()
+query_key = "search:{:.4f}:{:.4f}:{}:{}:{}".format(lat, lon, rayon, cat or "all", tri)
+cle = Compressor.cle(query_key)
+
+cached = CACHE.get(cle)
+if cached:
+dt = round((time.time() - t0) * 1000, 3)
+cached["cache_hit"] = True
+cached["latency_ms"] = dt
+return cached
+
+resultats = fusion(lat, lon, rayon, cat)
+
+if tri == "distance":
+resultats.sort(key=lambda x: x.get("distance_m", 999999))
+elif tri == "qualite":
+resultats.sort(key=lambda x: -x.get("qualite_score", 0))
+elif tri == "nom":
+resultats.sort(key=lambda x: (x.get("nom") or "").lower())
+elif tri == "source":
+resultats.sort(key=lambda x: x.get("source", ""))
+
+data = {
+"query": {"lat": lat, "lon": lon, "rayon": rayon, "categorie": cat, "tri": tri},
+"results": resultats,
+"count": len(resultats),
+"timestamp": datetime.now(timezone.utc).isoformat(),
+"version": VERSION,
+}
+
+CACHE.set(cle, data)
+ajouter_historique(lat, lon, rayon, cat, len(resultats))
+dt = round((time.time() - t0) * 1000, 3)
+data["cache_hit"] = False
+data["latency_ms"] = dt
+log_stats(query_key, dt, 0, len(resultats), rayon, cat)
+return data
+
+
+# ---------------------------------------------------------------
+# HTML
+# ---------------------------------------------------------------
+
+HTML = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NEXUS GEO-INTEL</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,system-ui,sans-serif;background:#05000a;color:#c8ffd0;min-height:100vh;padding:20px}
+.container{max-width:1300px;margin:0 auto}
+h1{font-size:clamp(22px,4vw,36px);font-weight:700;letter-spacing:-2px;background:linear-gradient(135deg,#00ffc8,#00c8ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:6px}
+.sub{color:#5a8a7a;font-size:12px;margin-bottom:20px;font-family:ui-monospace,monospace}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:16px}
+.stat{background:rgba(5,20,15,0.7);border:1px solid #1a3a2a;border-radius:10px;padding:14px}
+.stat-lbl{color:#5a8a7a;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}
+.stat-val{color:#00ffc8;font-size:20px;font-weight:700;font-family:ui-monospace,monospace}
+.card{background:rgba(5,20,15,0.7);border:1px solid #1a3a2a;border-radius:12px;padding:16px;margin-bottom:14px}
+.card h2{color:#00d4ff;font-size:11px;text-transform:uppercase;letter-spacing:2px;margin-bottom:12px}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+input,select{background:#05000a;border:1px solid #1a3a2a;border-radius:8px;padding:10px 12px;color:#c8ffd0;font-size:13px;font-family:inherit;outline:none}
+input:focus,select:focus{border-color:#00ffc8}
+input{flex:1;min-width:100px}
+button{background:#00ffc8;color:#000;border:none;padding:10px 20px;border-radius:8px;font-weight:700;font-size:13px;cursor:pointer;font-family:inherit}
+button:hover{background:#00c8ff}
+button.alt{background:transparent;color:#00ffc8;border:1px solid #1a3a2a}
+button.alt:hover{background:rgba(0,255,200,0.1);border-color:#00ffc8}
+.quick{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.quick button{background:rgba(0,255,200,0.1);color:#00ffc8;padding:8px 14px;font-size:12px;font-weight:600;border:1px solid rgba(0,255,200,0.3)}
+.quick button:hover{background:#00ffc8;color:#000}
+.result{background:rgba(5,20,15,0.5);border:1px solid #1a3a2a;border-radius:10px;padding:14px;margin-bottom:8px;position:relative}
+.result h3{color:#00ffc8;font-size:14px;margin-bottom:6px;padding-right:80px}
+.result .meta{color:#5a8a7a;font-size:11px;font-family:ui-monospace,monospace;line-height:1.6}
+.badge{display:inline-block;background:rgba(0,255,200,0.15);color:#00ffc8;font-size:9px;padding:2px 8px;border-radius:999px;font-weight:700;letter-spacing:1px;margin-left:6px}
+.badge.alt{background:rgba(0,200,255,0.15);color:#00c8ff}
+.fav-btn{position:absolute;top:14px;right:14px;background:rgba(255,200,0,0.15);color:#ffc800;border:1px solid rgba(255,200,0,0.3);padding:4px 10px;border-radius:6px;font-size:11px;cursor:pointer;font-weight:700}
+.fav-btn:hover{background:#ffc800;color:#000}
+.fav-btn.active{background:#ffc800;color:#000}
+.footer{text-align:center;color:#3a4a4a;font-size:10px;margin-top:30px;font-family:ui-monospace,monospace}
+.loading{text-align:center;padding:30px;color:#5a8a7a;font-family:ui-monospace,monospace}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>NEXUS GEO-INTEL</h1>
+<p class="sub">v__V__ - __AUTEUR__</p>
+
+<div class="grid" id="stats"></div>
+
+<div class="card">
+<h2>Recherche</h2>
+<div class="quick">
+<button onclick="detecter()">DETECTER POSITION</button>
+<button onclick="quick('restaurant')">RESTAURANTS</button>
+<button onclick="quick('cafe')">CAFES</button>
+<button onclick="quick('bar')">BARS</button>
+<button onclick="quick('fast_food')">FAST FOOD</button>
+<button onclick="quick('pharmacy')">PHARMACIES</button>
+<button onclick="quick('hospital')">HOPITAUX</button>
+<button onclick="quick('bank')">BANQUES</button>
+<button onclick="quick('supermarket')">SUPERMARCHES</button>
+<button onclick="quick('fuel')">STATIONS</button>
+<button onclick="quick('parking')">PARKINGS</button>
+<button onclick="quick('hotel')">HOTELS</button>
+<button onclick="quick('school')">ECOLES</button>
+<button onclick="quick('museum')">MUSEES</button>
+<button onclick="quick('library')">BIBLIOTHEQUES</button>
+<button onclick="quick('post_office')">POSTES</button>
+<button onclick="quick('police')">POLICE</button>
+<button onclick="quick('fire_station')">POMPIERS</button>
+<button onclick="quick('toilets')">TOILETTES</button>
+<button onclick="quick('atm')">DAB</button>
+</div>
+<div class="row">
+<input id="lat" placeholder="Latitude" value="48.8566" style="max-width:120px">
+<input id="lon" placeholder="Longitude" value="2.3522" style="max-width:120px">
+<input id="rayon" placeholder="Rayon" value="2000" style="max-width:110px">
+<input id="cat" placeholder="Categorie" style="flex:2">
+<select id="tri">
+<option value="distance">Tri distance</option>
+<option value="qualite">Tri qualite</option>
+<option value="nom">Tri nom</option>
+<option value="source">Tri source</option>
+</select>
+<button onclick="chercher()">CHERCHER</button>
+</div>
+<div class="row">
+<button class="alt" onclick="vider()">VIDER CACHE</button>
+<button class="alt" onclick="exportJson()">EXPORT JSON</button>
+<button class="alt" onclick="exportCsv()">EXPORT CSV</button>
+<button class="alt" onclick="voirFavoris()">FAVORIS</button>
+<button class="alt" onclick="voirHistorique()">HISTORIQUE</button>
+</div>
+</div>
+
+<div id="resultats"></div>
+
+<div class="footer">NEXUS GEO-INTEL v__V__ - Aissa Mohammedi (DGK)</div>
+</div>
+
+<script>
+function esc(s){return String(s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+var DERNIERS = [];
+
+async function loadStats(){
+try{
+var r = await fetch('/api/stats');
+var d = await r.json();
+var c = d.cache;
+var g = d.global;
+document.getElementById('stats').innerHTML =
+'<div class="stat"><div class="stat-lbl">RAM</div><div class="stat-val">'+c.entrees_ram+'</div></div>'+
+'<div class="stat"><div class="stat-lbl">SQLite</div><div class="stat-val">'+c.entrees_sqlite+'</div></div>'+
+'<div class="stat"><div class="stat-lbl">Compression</div><div class="stat-val">'+c.compression_pct+'%</div></div>'+
+'<div class="stat"><div class="stat-lbl">Latence moy</div><div class="stat-val">'+g.latence_moyenne_ms+' ms</div></div>'+
+'<div class="stat"><div class="stat-lbl">Requetes</div><div class="stat-val">'+g.requetes_total+'</div></div>'+
+'<div class="stat"><div class="stat-lbl">Cache hits</div><div class="stat-val">'+g.cache_hits+'</div></div>';
+}catch(e){}
+}
+
+async function detecter(){
+var res = document.getElementById('resultats');
+res.innerHTML = '<div class="loading">Detection position...</div>';
+try{
+var r = await fetch('/api/geoip');
+var d = await r.json();
+if(d.lat && d.lon){
+document.getElementById('lat').value = d.lat;
+document.getElementById('lon').value = d.lon;
+res.innerHTML = '<div class="loading">Position : '+esc(d.ville||'')+' '+esc(d.pays||'')+'<br>Lat '+d.lat+' Lon '+d.lon+'<br><br>Clique une categorie.</div>';
+} else {
+res.innerHTML = '<div class="loading" style="color:#ff4444">Detection impossible</div>';
+}
+}catch(e){
+res.innerHTML = '<div class="loading" style="color:#ff4444">Erreur '+esc(String(e))+'</div>';
+}
+}
+
+function quick(cat){
+document.getElementById('cat').value = cat;
+chercher();
+}
+
+async function chercher(){
+var lat = document.getElementById('lat').value;
+var lon = document.getElementById('lon').value;
+var rayon = document.getElementById('rayon').value;
+var cat = document.getElementById('cat').value;
+var tri = document.getElementById('tri').value;
+var res = document.getElementById('resultats');
+res.innerHTML = '<div class="loading">Recherche '+(cat||'tout')+'...</div>';
+try{
+var url = '/api/places/search?lat='+lat+'&lon='+lon+'&radius='+rayon+'&category='+encodeURIComponent(cat)+'&sort='+tri;
+var r = await fetch(url);
+var d = await r.json();
+DERNIERS = d.results || [];
+var hit = d.cache_hit ? 'CACHE' : 'CALCUL';
+var html = '<p style="color:'+(d.cache_hit?'#00ffc8':'#ffc800')+';margin-bottom:12px;font-family:ui-monospace,monospace;font-size:12px">'+hit+' - '+d.latency_ms+' ms - '+d.count+' resultats</p>';
+if(!d.results || d.results.length === 0){
+html += '<div class="loading">Aucun resultat. Augmente le rayon.</div>';
+}
+(d.results||[]).forEach(function(x, i){
+var b = '<span class="badge">'+esc(x.source||'?')+'</span>';
+var m = (x.sources_multiples||1) > 1 ? '<span class="badge alt">x'+x.sources_multiples+'</span>' : '';
+html += '<div class="result">'+
+'<button class="fav-btn" onclick="fav('+i+')">FAV</button>'+
+'<h3>'+esc(x.nom||'Sans nom')+b+m+'</h3>'+
+'<div class="meta">'+esc(x.categorie||'?')+' - '+esc(x.adresse||x.ville||'')+'</div>'+
+'<div class="meta">'+x.distance_m+' m - qualite '+(x.qualite_score||0).toFixed(0)+'/100</div>'+
+(x.telephone ? '<div class="meta">tel '+esc(x.telephone)+'</div>' : '')+
+(x.horaires ? '<div class="meta">'+esc(x.horaires)+'</div>' : '')+
+'</div>';
+});
+res.innerHTML = html;
+loadStats();
+}catch(e){
+res.innerHTML = '<div class="loading" style="color:#ff4444">Erreur '+esc(String(e))+'</div>';
+}
+}
+
+async function fav(i){
+var x = DERNIERS[i];
+if(!x) return;
+await fetch('/api/favoris/add', {
+method:'POST',
+headers:{'Content-Type':'application/json'},
+body: JSON.stringify({lieu: x, note: 5})
+});
+var btns = document.querySelectorAll('.fav-btn');
+if(btns[i]){ btns[i].classList.add('active'); btns[i].textContent = 'OK'; }
+}
+
+async function vider(){
+if(!confirm('Vider le cache ?')) return;
+await fetch('/api/cache/clear', {method:'POST'});
+loadStats();
+}
+
+function exportJson(){
+if(!DERNIERS.length){alert('Cherche d abord');return;}
+var blob = new Blob([JSON.stringify({count:DERNIERS.length, resultats:DERNIERS}, null, 2)], {type:'application/json'});
+var a = document.createElement('a');
+a.href = URL.createObjectURL(blob);
+a.download = 'nexus_geo.json';
+a.click();
+}
+
+function exportCsv(){
+if(!DERNIERS.length){alert('Cherche d abord');return;}
+var csv = 'nom,categorie,adresse,lat,lon,distance_m,source,qualite\\n';
+DERNIERS.forEach(function(r){
+csv += [r.nom, r.categorie, r.adresse, r.lat, r.lon, r.distance_m, r.source, r.qualite_score||0]
+.map(function(x){return String(x||'').replace(/,/g,';');}).join(',') + '\\n';
+});
+var blob = new Blob([csv], {type:'text/csv'});
+var a = document.createElement('a');
+a.href = URL.createObjectURL(blob);
+a.download = 'nexus_geo.csv';
+a.click();
+}
+
+async function voirFavoris(){
+var res = document.getElementById('resultats');
+var r = await fetch('/api/favoris/list');
+var d = await r.json();
+var html = '<div class="card"><h2>Favoris ('+(d.favoris||[]).length+')</h2>';
+(d.favoris||[]).forEach(function(f){
+html += '<div class="result"><h3>'+esc(f.nom)+'</h3>'+
+'<div class="meta">'+esc(f.categorie||'')+' - '+esc(f.adresse||'')+'</div></div>';
+});
+if(!d.favoris || !d.favoris.length){html += '<div class="loading">Aucun favori</div>';}
+html += '</div>';
+res.innerHTML = html;
+}
+
+async function voirHistorique(){
+var res = document.getElementById('resultats');
+var r = await fetch('/api/historique/list');
+var d = await r.json();
+var html = '<div class="card"><h2>Historique</h2>';
+(d.historique||[]).forEach(function(h){
+html += '<div class="result"><h3>'+esc(h.categorie||'tout')+'</h3>'+
+'<div class="meta">lat '+h.lat+' lon '+h.lon+' - '+h.rayon+'m - '+h.resultats+' resultats</div></div>';
+});
+if(!d.historique || !d.historique.length){html += '<div class="loading">Aucun historique</div>';}
+html += '</div>';
+res.innerHTML = html;
+}
+
+loadStats();
+setInterval(loadStats, 5000);
+</script>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------
+# SERVEUR
+# ---------------------------------------------------------------
+
+class Handler(BaseHTTPRequestHandler):
+def log_message(self, *a):
+pass
+
+def _send(self, code, content, ctype="application/json"):
+try:
+gz = None
+if len(content) > 500 and "gzip" in self.headers.get("Accept-Encoding", ""):
+content = gzip.compress(content, 6)
+gz = "gzip"
+self.send_response(code)
+self.send_header("Content-Type", ctype + "; charset=utf-8")
+self.send_header("Access-Control-Allow-Origin", "*")
+self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+self.send_header("Access-Control-Allow-Headers", "Content-Type")
+if gz:
+self.send_header("Content-Encoding", gz)
+self.send_header("Content-Length", str(len(content)))
+self.end_headers()
+self.wfile.write(content)
+except (BrokenPipeError, ConnectionResetError):
+pass
+
+def _json(self, obj, code=200):
+self._send(code, json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8"))
+
+def _html(self, html):
+self._send(200, html.encode("utf-8"), "text/html")
+
+def do_OPTIONS(self):
+self._send(204, b"")
+
+def do_GET(self):
+ip = self.client_address[0] if self.client_address else "?"
+if not RATE.allow(ip):
+return self._json({"erreur": "rate limit"}, 429)
+
+try:
+u = urllib.parse.urlparse(self.path)
+p = u.path
+q = urllib.parse.parse_qs(u.query)
+
+if p in ("/", "/index.html"):
+html = HTML.replace("__V__", VERSION).replace("__AUTEUR__", AUTEUR)
+return self._html(html)
+
+if p == "/api/health":
+return self._json({"status": "ok", "version": VERSION})
+
+if p == "/api/geoip":
+pos = geoloc_ip()
+if pos:
+return self._json(pos)
+return self._json({"erreur": "geoip impossible"}, 500)
+
+if p == "/api/places/search":
+try:
+lat = float(q.get("lat", ["48.8566"])[0])
+lon = float(q.get("lon", ["2.3522"])[0])
+rayon = int(q.get("radius", [str(CONFIG["rayon_defaut"])])[0])
+cat = q.get("category", [None])[0] or None
+if cat == "":
+cat = None
+tri = q.get("sort", ["distance"])[0]
+except Exception:
+return self._json({"erreur": "params invalides"}, 400)
+return self._json(search(lat, lon, rayon, cat, tri))
+
+if p == "/api/stats":
+return self._json({
+"cache": CACHE.stats(),
+"global": stats_globales(),
+"timestamp": datetime.now(timezone.utc).isoformat(),
+})
+
+if p == "/api/favoris/list":
+return self._json({"favoris": lister_favoris()})
+
+if p == "/api/historique/list":
+return self._json({"historique": lister_historique(100)})
+
+return self._json({"erreur": "not found"}, 404)
+except Exception as e:
+return self._json({"erreur": str(e)[:200]}, 500)
+
+def do_POST(self):
+ip = self.client_address[0] if self.client_address else "?"
+if not RATE.allow(ip):
+return self._json({"erreur": "rate limit"}, 429)
+
+try:
+u = urllib.parse.urlparse(self.path)
+p = u.path
+length = int(self.headers.get("Content-Length", 0))
+body = self.rfile.read(length).decode("utf-8", "ignore") if length else "{}"
+try:
+data = json.loads(body)
+except Exception:
+data = {}
+
+if p == "/api/cache/clear":
+CACHE.vider()
+return self._json({"status": "ok"})
+
+if p == "/api/favoris/add":
+lieu = data.get("lieu", {})
+note = int(data.get("note", 5))
+fid = ajouter_favori(lieu, note)
+return self._json({"status": "ok", "id": fid})
+
+return self._json({"erreur": "not found"}, 404)
+except Exception as e:
+return self._json({"erreur": str(e)[:200]}, 500)
+
+
+def main():
+init_db()
+server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+server.daemon_threads = True
+print("================================================================")
+print(" NEXUS GEO-INTEL v" + VERSION)
+print(" Auteur : Aissa Mohammedi (DGK)")
+print(" Licence : NEXUS-OPEN-2.0")
+print("================================================================")
+print()
+print(" Interface : http://localhost:" + str(PORT) + "/")
+print(" Sources : 6 (OSM, Nominatim, Photon, Wikidata, Overpass, Local)")
+print(" Categories: 20 boutons rapides")
+print(" Features : detection IP, favoris, historique, export JSON/CSV")
+print()
+print(" Ctrl+C pour arreter.")
+print()
+try:
+server.serve_forever()
+except KeyboardInterrupt:
+print("\nArrete.")
+
+
+if __name__ == "__main__":
+main()
